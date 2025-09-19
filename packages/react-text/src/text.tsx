@@ -1,4 +1,11 @@
-import { createEditor, type Descendant, Range, Transforms } from 'slate';
+import {
+  createEditor,
+  type Descendant,
+  Range,
+  Transforms,
+  Editor,
+  Node,
+} from 'slate';
 import { isKeyHotkey } from 'is-hotkey';
 import {
   Editable,
@@ -14,11 +21,25 @@ import {
   type ParagraphElement,
   type TextProps,
 } from '@plait/common';
-import React, { useMemo, useCallback, useEffect, CSSProperties } from 'react';
+import React, {
+  useMemo,
+  useCallback,
+  useEffect,
+  useRef,
+  useState,
+  CSSProperties,
+} from 'react';
 import { withHistory } from 'slate-history';
 import { isUrl, LinkEditor } from '@plait/text-plugins';
 import { withText } from './plugins/with-text';
 import { CustomEditor, RenderElementPropsFor } from './custom-types';
+import {
+  buildMarkdownParagraph,
+  isParagraphEqual,
+  parseMarkdownParagraph,
+  serializeParagraphToMarkdown,
+  normalizeMarkdownString,
+} from './utils/markdown';
 
 import './styles/index.scss';
 import { LinkComponent, withInlineLink } from './plugins/with-link';
@@ -28,30 +49,80 @@ export type TextComponentProps = TextProps;
 export const Text: React.FC<TextComponentProps> = (
   props: TextComponentProps
 ) => {
-  const { text, readonly, onChange, onComposition, afterInit } = props;
+  const { text, readonly, onChange, onComposition, afterInit, textPlugins } =
+    props;
+
+  const paragraphText = text as ParagraphElement;
+  const textAlign = paragraphText.align;
 
   const renderLeaf = useCallback(
     (props: RenderLeafProps) => <Leaf {...props} />,
     []
   );
 
-  const initialValue: Descendant[] = [text];
+  const [initialValue] = useState<Descendant[]>(() => {
+    const markdown = serializeParagraphToMarkdown(paragraphText);
+    const paragraph =
+      readonly === false
+        ? buildMarkdownParagraph(markdown, textAlign)
+        : parseMarkdownParagraph(markdown, textAlign);
+    return [paragraph];
+  });
 
   const editor = useMemo(() => {
-    const editor = withInlineLink(
+    let instance = withInlineLink(
       withText(withHistory(withReact(createEditor())))
-    );
-    afterInit && afterInit(editor);
-    return editor;
-  }, []);
+    ) as CustomEditor;
+    if (textPlugins && textPlugins.length) {
+      textPlugins.forEach((plugin) => {
+        instance = plugin(instance) as CustomEditor;
+      });
+    }
+    afterInit && afterInit(instance);
+    return instance;
+  }, [afterInit, textPlugins]);
+
+  const previousReadonlyRef = useRef<boolean | undefined>(readonly);
+  const isSyncingRef = useRef(false);
+
+  const setEditorValue = useCallback(
+    (paragraph: ParagraphElement) => {
+      const current = editor.children[0] as ParagraphElement | undefined;
+      if (isParagraphEqual(current, paragraph)) {
+        return;
+      }
+      isSyncingRef.current = true;
+      Editor.withoutNormalizing(editor, () => {
+        editor.children = [paragraph];
+      });
+      editor.onChange();
+      isSyncingRef.current = false;
+    },
+    [editor]
+  );
 
   useEffect(() => {
-    if (text === editor.children[0]) {
-      return;
+    const previousReadonly = previousReadonlyRef.current;
+    const markdownSource = normalizeMarkdownString(
+      serializeParagraphToMarkdown(paragraphText)
+    );
+    if (readonly === false) {
+      if (previousReadonly !== false) {
+        const markdownParagraph = buildMarkdownParagraph(
+          markdownSource,
+          textAlign
+        );
+        setEditorValue(markdownParagraph);
+      }
+    } else {
+      const parsedParagraph = parseMarkdownParagraph(
+        markdownSource,
+        textAlign
+      );
+      setEditorValue(parsedParagraph);
     }
-    editor.children = [text];
-    editor.onChange();
-  }, [text, editor]);
+    previousReadonlyRef.current = readonly;
+  }, [text, readonly, setEditorValue]);
 
   const onKeyDown: React.KeyboardEventHandler<HTMLInputElement> = (event) => {
     const { selection } = editor;
@@ -81,10 +152,22 @@ export const Text: React.FC<TextComponentProps> = (
     <Slate
       editor={editor}
       initialValue={initialValue}
-      onChange={(value: Descendant[]) => {
+      onChange={() => {
+        if (isSyncingRef.current) {
+          return;
+        }
+        const currentParagraph = editor.children[0] as ParagraphElement;
+        const markdownSource =
+          readonly === false
+            ? normalizeMarkdownString(Node.string(currentParagraph))
+            : serializeParagraphToMarkdown(currentParagraph);
+        const normalizedParagraph = parseMarkdownParagraph(
+          markdownSource,
+          currentParagraph.align
+        );
         onChange &&
           onChange({
-            newText: editor.children[0] as ParagraphElement,
+            newText: normalizedParagraph,
             operations: editor.operations,
           });
       }}
@@ -147,24 +230,43 @@ const ParagraphComponent = ({
 };
 
 const Leaf: React.FC<RenderLeafProps> = ({ children, leaf, attributes }) => {
-  if ((leaf as CustomText).bold) {
-    children = <strong>{children}</strong>;
+  const customLeaf = leaf as CustomText;
+  let content = children;
+
+  if (customLeaf.bold) {
+    content = <strong>{content}</strong>;
   }
 
-  if ((leaf as CustomText).code) {
-    children = <code>{children}</code>;
+  if (customLeaf.italic) {
+    content = <em>{content}</em>;
   }
 
-  if ((leaf as CustomText).italic) {
-    children = <em>{children}</em>;
+  if (customLeaf.underlined) {
+    content = <u>{content}</u>;
   }
 
-  if ((leaf as CustomText).underlined) {
-    children = <u>{children}</u>;
+  if (customLeaf.strike) {
+    content = <s>{content}</s>;
   }
+
+  if (customLeaf.code) {
+    content = <code>{content}</code>;
+  }
+
+  const style: CSSProperties = {
+    color: customLeaf.color,
+  };
+
+  if (customLeaf['font-size']) {
+    const fontSize = customLeaf['font-size'];
+    const normalizedSize = fontSize.endsWith('px') ? fontSize : `${fontSize}px`;
+    style.fontSize = normalizedSize;
+    style.lineHeight = '1.4em';
+  }
+
   return (
-    <span style={{ color: (leaf as CustomText).color }} {...attributes}>
-      {children}
+    <span style={style} {...attributes}>
+      {content}
     </span>
   );
 };
